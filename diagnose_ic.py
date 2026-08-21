@@ -157,6 +157,98 @@ def d3_limit_selection(score: pd.DataFrame, px: dict,
 
 
 # ============================================================
+# D5 波动率分层 —— alpha 是否寄生在高波动上
+# ============================================================
+
+VOL_BUCKETS = [(0.0, 1 / 3, "低波动"), (1 / 3, 2 / 3, "中波动"), (2 / 3, 1.0, "高波动")]
+
+
+def _atr_pct(px: dict, n: int = 14) -> pd.DataFrame:
+    """ATR / 收盘价，与 backtest 里 k_stop × ATR 的口径一致。"""
+    from pullback_momentum import _atr
+    return _atr(px["high"], px["low"], px["close"], n) / px["close"]
+
+
+def d5_vol_conditional(score: pd.DataFrame, px: dict, h: int = 10,
+                       n_groups: int = 5) -> None:
+    """
+    D4 反推出模型选中标的的 ATR/价格 ≈ 5.17%，约为市场 1.8 倍。
+    直接加波动率上限有个陷阱：2021-2023 的高动量 ≡ 赛道股 ≡ 高波动，
+    过滤高波动可能把 alpha 一起过滤掉。
+
+    在每个波动率桶【内部】重跑分组，看 alpha 是否依赖高波动。
+
+    ⚠️ 判据必须用 RankIC，不能用 Q5-Q1 原始收益差：高波动票的收益离散度
+    天然更大，即使预测能力完全相同，原始价差也必然更宽 —— 那个指标
+    结构性地偏向「高波动更有 alpha」。已用合成数据验证过这一点。
+    表里同时给出 Q5-Q1/σ（用桶内收益标准差归一）作为参照。
+    """
+    close, open_ = px["close"], px["open"]
+    tradable = px["tradable"]
+    ap = _atr_pct(px).where(tradable)
+    sc = score.where(tradable)
+    fwd = _fwd_ret(close, open_, h).where(tradable)
+
+    vq = ap.rank(axis=1, pct=True)          # 每日截面上的波动率分位
+
+    print(f"  全市场 ATR/价格 中位数 {ap.stack().median():.2%}")
+    rows, rics = [], []
+    for lo, hi, name in VOL_BUCKETS:
+        inb = (vq > lo) & (vq <= hi) if lo else (vq >= 0) & (vq <= hi)
+        # 桶内重新做截面分位，否则高分组会被波动率本身主导
+        q = sc.where(inb).rank(axis=1, pct=True)
+
+        vals = []
+        for g in range(n_groups):
+            a, b = g / n_groups, (g + 1) / n_groups
+            m = ((q > a) & (q <= b)) if g else ((q >= 0) & (q <= b))
+            vals.append(fwd.where(m).mean(axis=1).dropna().mean())
+
+        ric = []
+        for d in sc.index:
+            aa, bb = sc.loc[d].where(inb.loc[d]), fwd.loc[d].where(inb.loc[d])
+            m2 = aa.notna() & bb.notna()
+            if m2.sum() >= 30:
+                ric.append(aa[m2].corr(bb[m2], method="spearman"))
+        ric_m = float(np.mean(ric)) if ric else np.nan
+        rics.append(ric_m)
+
+        sd = float(fwd.where(inb).stack().std())
+        spread = vals[-1] - vals[0]
+        row = {"波动桶": name, "ATR/价格": f"{ap.where(inb).stack().median():.2%}"}
+        for g, v in enumerate(vals):
+            row[f"Q{g + 1}"] = f"{v:+.2%}"
+        row["Q5-Q1"] = f"{spread:+.2%}"
+        row["Q5-Q1/σ"] = f"{spread / sd:+.3f}" if sd else "—"
+        row["RankIC"] = f"{ric_m:+.4f}" if np.isfinite(ric_m) else "—"
+        row["单调"] = "✓" if all(vals[i] <= vals[i + 1] + 1e-5
+                                for i in range(len(vals) - 1)) else "✗"
+        rows.append(row)
+
+    print("\n" + pd.DataFrame(rows).to_string(index=False))
+    print(f"\n  Q1=桶内最低分，Q{n_groups}=桶内最高分；{h} 日持有，毛收益等权。")
+    print("  ⚠️ 跨桶比较看 RankIC 与 Q5-Q1/σ，不要看 Q5-Q1 原始值。")
+
+    lo_ic, mid_ic, hi_ic = rics
+    print("\n  " + "-" * 58)
+    if not np.isfinite(lo_ic) or not np.isfinite(hi_ic):
+        print("  → 样本不足，无法判定。")
+    elif lo_ic > 0.01 and lo_ic >= hi_ic * 0.5:
+        print(f"  → 低波动桶 RankIC {lo_ic:+.4f} ≈ 高波动桶 {hi_ic:+.4f}，")
+        print("     alpha 不依赖高波动。可以加波动率上限（如 ATR/价格 ≤ 中位数×1.3），")
+        print("     预期只削掉尾部亏损、不伤 alpha。")
+    elif lo_ic <= 0.01 or hi_ic > lo_ic * 3:
+        print(f"  → 低波动桶 RankIC {lo_ic:+.4f} 远弱于高波动桶 {hi_ic:+.4f}，")
+        print("     alpha 主要寄生在高波动上。直接过滤会把收益一起过滤掉。")
+        print("     改走波动率加权仓位：仓位 ∝ 1/ATR，等化风险预算而非剔除标的。")
+    else:
+        print(f"  → 各桶 RankIC {lo_ic:+.4f} / {mid_ic:+.4f} / {hi_ic:+.4f} 梯度温和，")
+        print("     波动率是部分可分离的维度，过滤有代价但不致命。")
+        print("     建议先做温和上限（剔除最高 1/6），再看 alpha 损失多少。")
+    print("  " + "-" * 58)
+
+
+# ============================================================
 # D4 止损法证 —— 设计宽度 vs 实际成交
 # ============================================================
 
@@ -259,6 +351,8 @@ def main() -> int:
     ap.add_argument("--top-pct", type=float, default=0.05)
     ap.add_argument("--stops-only", action="store_true",
                     help="跳过 D1-D3，只跑 D4 止损法证（需要回测）")
+    ap.add_argument("--vol-only", action="store_true",
+                    help="只跑 D5 波动率分层，不做回测")
     args = ap.parse_args()
 
     if not args.score.exists():
@@ -274,6 +368,13 @@ def main() -> int:
     score.index = pd.to_datetime(score.index)
     px = load_panel(args.panel, score, cfg)
     score = score.reindex(index=px["close"].index, columns=px["close"].columns)
+
+    if args.vol_only:
+        print("=" * 66)
+        print(f"D5  波动率分层（{args.hold} 日持有）")
+        print("=" * 66)
+        d5_vol_conditional(score, px, args.hold)
+        return 0
 
     print("\n" + "=" * 66)
     print("D1  IC 期限衰减  —— 决定持仓周期该多长")
@@ -294,6 +395,11 @@ def main() -> int:
     print(f"D3  一字板逆向选择（{args.hold} 日持有）")
     print("=" * 66)
     d3_limit_selection(score, px, args.top_pct, args.hold)
+
+    print("\n" + "=" * 66)
+    print(f"D5  波动率分层（{args.hold} 日持有） —— alpha 是否寄生在高波动上")
+    print("=" * 66)
+    d5_vol_conditional(score, px, args.hold)
 
     run_with_backtest(args.score, args.panel, args.top_pct)
     return 0
