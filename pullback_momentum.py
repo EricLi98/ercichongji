@@ -57,6 +57,10 @@ class Config:
     vol_up: float = 1.20        # 触发日成交量 / 前5日均量
 
     # ---- 过滤 ----
+    # 波动率上限（ATR/收盘价）。None = 不限制。
+    # ⚠️ D5 显示高波动桶的风险调整预测力是低波动桶的 2 倍，
+    #    直接设上限会切掉 alpha 密度最高的部分。先试 max_positions / vol_weight。
+    max_atr_pct: float | None = None
     min_amount: float = 5e7     # 20日均成交额下限（元），保证可容纳资金
     min_list_days: int = 250    # 剔除次新股
     exclude_st: bool = True
@@ -66,6 +70,11 @@ class Config:
     max_positions: int = 10
 
     # ATR 止损：止损距离随个股波动率自适应，10cm/20cm 板块自动可比
+    # 仓位 ∝ 1/ATR：不剔除高波动票，改用更小的仓位承载，等化风险预算。
+    # 保留高波动桶的 alpha，同时让各票止损时的 NAV 冲击一致。
+    vol_weight: bool = False
+    vol_weight_clip: tuple = (0.4, 2.0)   # 相对等权仓位的倍数上下限
+
     use_atr_stop: bool = True   # False 时退回下方固定百分比
     atr_n: int = 14
     k_stop: float = 2.5         # 硬止损  = 入场价 − k_stop × ATR(入场时冻结)
@@ -145,6 +154,9 @@ def build_panel(df: pd.DataFrame, cfg: Config) -> dict:
     if cfg.exclude_st and 'is_st' in df.columns:
         st = df.pivot(index='date', columns='code', values='is_st').reindex_like(close).fillna(False)
         ok &= ~st.astype(bool)
+    if cfg.max_atr_pct is not None:
+        from_atr = _atr(high, low, close, cfg.atr_n) / close
+        ok &= from_atr <= cfg.max_atr_pct
     px['tradable'] = ok.fillna(False)
 
     return px
@@ -259,12 +271,15 @@ def backtest(px: dict, signal: pd.DataFrame, score: pd.DataFrame, cfg: Config):
     close, open_ = px['close'], px['open']
     ma_x = close.rolling(cfg.ma_exit).mean()          # 出场均线，独立于入场门槛
     atr = _atr(px['high'], px['low'], close, cfg.atr_n)
+    atr_pct = atr / close
+    atr_med = atr_pct.median(axis=1)              # 每日截面中位数，作为风险预算基准
 
     dates, codes = close.index, close.columns
     C, O = close.values, open_.values
     CB, CS = px['can_buy'].values, px['can_sell'].values
     MX, SIG, SC = ma_x.values, signal.values, score.values
     ATR = atr.values
+    APCT, AMED = atr_pct.values, atr_med.values
 
     cash = cfg.init_cash
     book = {}                      # col_idx -> dict
@@ -304,7 +319,13 @@ def backtest(px: dict, signal: pd.DataFrame, score: pd.DataFrame, cfg: Config):
             if not CB[t, j] or np.isnan(O[t, j]):
                 continue                                   # 一字板/停牌，放弃
             p = O[t, j] * (1 + cfg.slippage)
-            target = min(cash / (1 + cfg.commission), equity_est / cfg.max_positions)
+            w = 1.0
+            if cfg.vol_weight:
+                ai, am = APCT[t, j], AMED[t]
+                if np.isfinite(ai) and np.isfinite(am) and ai > 0:
+                    w = float(np.clip(am / ai, *cfg.vol_weight_clip))
+            target = min(cash / (1 + cfg.commission),
+                         equity_est / cfg.max_positions * w)
             shares = int(target / p // 100) * 100           # 整手
             if shares <= 0:
                 continue
@@ -376,7 +397,8 @@ def backtest(px: dict, signal: pd.DataFrame, score: pd.DataFrame, cfg: Config):
 # 4. 绩效
 # ============================================================
 
-def performance(equity: pd.Series, trades: pd.DataFrame, freq: int = 242) -> dict:
+def performance(equity: pd.Series, trades: pd.DataFrame, freq: int = 242,
+                max_positions: int | None = None) -> dict:
     eq = equity[equity > 0]
     ret = eq.pct_change().dropna()
     years = len(eq) / freq
@@ -395,6 +417,11 @@ def performance(equity: pd.Series, trades: pd.DataFrame, freq: int = 242) -> dic
         '盈亏比':   (f"{trades.loc[win, 'ret'].mean() / abs(trades.loc[~win, 'ret'].mean()):.2f}"
                      if len(trades) and (~win).any() else '-'),
         '平均持仓': f"{trades['days'].mean():.1f}日" if len(trades) else '-',
+        # 平均在手仓位数 = 总持仓天数 / 交易日数。
+        # 若显著低于 max_positions，说明名额没填满、资金闲置，
+        # 此时 max_positions 的对比会被现金拖累污染，不可直接比较。
+        '平均在手': (f"{trades['days'].sum() / len(eq):.1f}"
+                     + (f"/{max_positions}" if max_positions else '')) if len(trades) else '-',
     }
 
 

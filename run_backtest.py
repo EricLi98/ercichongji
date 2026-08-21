@@ -124,11 +124,18 @@ def explore(df: pd.DataFrame):
 # 参数平原
 # ============================================================
 
-_PANEL_PARAMS = {"min_amount", "min_list_days", "exclude_st"}   # 影响 build_panel 的参数
+_PANEL_PARAMS = {"min_amount", "min_list_days", "exclude_st", "max_atr_pct"}   # 影响 build_panel 的参数
 
 _SWEEP_GRID = [
     # 风控层优先：上一轮 explore 显示成本拖累 12.25%/年，
     # 止损宽度与持有周期决定换手，是当前的主要矛盾。
+    # 尾部风控优先。D4/D5 显示 3 笔灾难单(占止损 2.9%)多吃掉 12.6% NAV，
+    # 而 max_positions 是唯一零 alpha 代价的杠杆 —— 先扫它。
+    ("max_positions", [10, 15, 20, 30, 50]),
+    ("vol_weight",    [False, True]),
+    # 波动率上限放最后：D5 显示高波动桶的风险调整预测力是低波动桶 2 倍，
+    # 设上限会切掉 alpha 密度最高的部分，须实测代价而非拍脑袋定 1.3x 中位数。
+    ("max_atr_pct",   [None, 0.045, 0.052, 0.060, 0.070]),
     ("k_stop",        [1.5, 2.0, 2.5, 3.0, 3.5, 4.0]),
     ("k_trail",       [3.0, 4.0, 5.0, 6.0, 8.0]),
     ("max_hold",      [15, 20, 30, 45, 60]),
@@ -156,11 +163,12 @@ def sweep(df: pd.DataFrame, base_cfg: Config, param: str, values: list) -> pd.Da
         px = build_panel(df, cfg) if rebuild else px0
         sig, score = generate_signals(px, cfg)
         eq, tr = backtest(px, sig, score, cfg)
-        st = performance(eq, tr)
+        st = performance(eq, tr, max_positions=cfg.max_positions)
         tpy = len(tr) / cfg.max_positions / years        # 每槽年周转
         rows.append({param: v, "年化": st["年化"], "最大回撤": st["最大回撤"],
                      "夏普": st["夏普"], "胜率": st["胜率"], "交易数": st["交易次数"],
-                     "周转/年": f"{tpy:.1f}", "成本拖累": f"{-(1 - (1 - rt) ** tpy):.2%}"})
+                     "周转/年": f"{tpy:.1f}", "成本拖累": f"{-(1 - (1 - rt) ** tpy):.2%}",
+                     "在手/上限": st["平均在手"]})
     return pd.DataFrame(rows)
 
 
