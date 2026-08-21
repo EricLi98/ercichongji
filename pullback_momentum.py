@@ -281,9 +281,15 @@ def backtest(px: dict, signal: pd.DataFrame, score: pd.DataFrame, cfg: Config):
             b = book.pop(j)
             gross = p * b['shares']
             cash += gross * (1 - cfg.commission - cfg.stamp_tax)
+            et = b.get('exit_t', t - 1)
+            spx = b.get('exit_px', np.nan)
             trades.append(dict(code=codes[j], entry=b['entry'], exit=p,
                                open_date=b['date'], close_date=dates[t],
                                days=b['days'], ret=p / b['entry'] - 1,
+                               # 出场信号日 -> 实际成交日 顺延了几个交易日（0=次日正常成交）
+                               defer_days=int(t - et - 1),
+                               # 信号日收盘 -> 成交价 的滑移；跌停顺延时这里会很负
+                               slip_to_fill=(p / spx - 1) if spx and np.isfinite(spx) else np.nan,
                                stop_pct=(cfg.k_stop * b.get('atr0', np.nan) / b['entry']
                                          if cfg.use_atr_stop else cfg.stop_loss),
                                reason=b['reason']))
@@ -348,8 +354,10 @@ def backtest(px: dict, signal: pd.DataFrame, score: pd.DataFrame, cfg: Config):
                 r = 'break_ma'
             elif b['days'] >= cfg.max_hold:
                 r = 'timeout'
-            if r and b['days'] >= 1:                       # T+1 限制
+            if r and b['days'] >= 1 and not b['reason']:    # T+1 限制；只首次登记
                 b['reason'] = r
+                b['exit_t'] = t                            # 出场信号发生在哪一天
+                b['exit_px'] = c                           # 信号日收盘价
                 pend_sell.append(j)
 
         # ---- E. 入场排序（T 日收盘） ----
