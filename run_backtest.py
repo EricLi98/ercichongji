@@ -177,18 +177,30 @@ def run_sweep(df: pd.DataFrame, cfg: Config | None = None) -> None:
 # ============================================================
 
 def score_to_signal_backtest(df: pd.DataFrame, score_path, cfg: Config | None = None,
-                             top_pct: float = 0.05):
+                             top_pct: float = 0.05, clip_to_score: bool = True):
     """
     把 date × code 的模型打分接进本地回测引擎。
 
     刻意不用 Qlib 自带回测：其 limit_threshold 默认 None（涨跌停不限制），
     且无 ST 标记。本引擎保留一字板不可买、跌停不可卖、T+1、真实成本。
+
+    clip_to_score=True 时把面板裁到打分的日期范围。**必须裁**：否则打分覆盖不到的
+    尾部会被当成空仓期计入 performance() 的年化分母，把亏损摊薄。
+    （曾经把 3 年的 -48% 摊成 5.6 年的 -11.09%/年，实际是 -19.76%/年。）
     """
     cfg = cfg or Config()
-    px = build_panel(df, cfg)
 
     score = pd.read_parquet(score_path)
     score.index = pd.to_datetime(score.index)
+
+    if clip_to_score:
+        s0, s1 = score.index.min(), score.index.max()
+        n0 = len(df)
+        df = df[(df["date"] >= s0) & (df["date"] <= s1)]
+        print(f"面板裁剪至打分区间 {s0:%Y-%m-%d} → {s1:%Y-%m-%d}"
+              f"（{n0:,} → {len(df):,} 行）")
+
+    px = build_panel(df, cfg)
     score = score.reindex(index=px["close"].index, columns=px["close"].columns)
 
     signal = ((score.rank(axis=1, pct=True) >= 1 - top_pct)
@@ -197,7 +209,8 @@ def score_to_signal_backtest(df: pd.DataFrame, score_path, cfg: Config | None = 
     cov = score.notna().sum().sum() / max(px["close"].notna().sum().sum(), 1)
     print(f"打分覆盖率 {cov:.1%}，日均信号 {signal.sum(axis=1).mean():.1f}")
     if cov < 0.5:
-        print("⚠️  覆盖率偏低：检查代码格式是否对齐（qlib SH600519 vs Tushare 600519.SH）")
+        print("⚠️  覆盖率仍偏低：检查代码格式是否对齐"
+              "（qlib SH600519 vs Tushare 600519.SH）")
 
     eq, trades = backtest(px, signal, score.fillna(-np.inf), cfg)
     return dict(equity=eq, trades=trades, stats=performance(eq, trades),
