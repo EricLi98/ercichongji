@@ -2,3 +2,7 @@ duckdb
 pandas
 numpy
 pyarrow
+
+# qlib_train.py 可选依赖
+pyqlib>=0.9.6
+lightgbm>=4.0

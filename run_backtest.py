@@ -172,6 +172,38 @@ def run_sweep(df: pd.DataFrame, cfg: Config | None = None) -> None:
     print("\n判据：结果应随参数连续变化。单点跳高 = 噪音，不是参数。")
 
 
+# ============================================================
+# 接入外部打分（qlib_train.py 导出的 Alpha158 模型分数）
+# ============================================================
+
+def score_to_signal_backtest(df: pd.DataFrame, score_path, cfg: Config | None = None,
+                             top_pct: float = 0.05):
+    """
+    把 date × code 的模型打分接进本地回测引擎。
+
+    刻意不用 Qlib 自带回测：其 limit_threshold 默认 None（涨跌停不限制），
+    且无 ST 标记。本引擎保留一字板不可买、跌停不可卖、T+1、真实成本。
+    """
+    cfg = cfg or Config()
+    px = build_panel(df, cfg)
+
+    score = pd.read_parquet(score_path)
+    score.index = pd.to_datetime(score.index)
+    score = score.reindex(index=px["close"].index, columns=px["close"].columns)
+
+    signal = ((score.rank(axis=1, pct=True) >= 1 - top_pct)
+              & px["tradable"] & ~px["limit_up"].fillna(False)).fillna(False)
+
+    cov = score.notna().sum().sum() / max(px["close"].notna().sum().sum(), 1)
+    print(f"打分覆盖率 {cov:.1%}，日均信号 {signal.sum(axis=1).mean():.1f}")
+    if cov < 0.5:
+        print("⚠️  覆盖率偏低：检查代码格式是否对齐（qlib SH600519 vs Tushare 600519.SH）")
+
+    eq, trades = backtest(px, signal, score.fillna(-np.inf), cfg)
+    return dict(equity=eq, trades=trades, stats=performance(eq, trades),
+                label=f"Alpha158 模型 top{top_pct:.0%}")
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "explore"
 
