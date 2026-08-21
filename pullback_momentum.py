@@ -64,10 +64,22 @@ class Config:
     # ---- 组合与风控 ----
     init_cash: float = 1_000_000
     max_positions: int = 10
-    stop_loss: float = 0.07     # 相对成本价硬止损
-    trail_stop: float = 0.12    # 自持仓最高收盘价回撤止盈
+
+    # ATR 止损：止损距离随个股波动率自适应，10cm/20cm 板块自动可比
+    use_atr_stop: bool = True   # False 时退回下方固定百分比
+    atr_n: int = 14
+    k_stop: float = 2.5         # 硬止损  = 入场价 − k_stop × ATR(入场时冻结)
+    k_trail: float = 4.0        # 移动止盈 = 持仓最高收盘 − k_trail × ATR(入场时冻结)
+
+    stop_loss: float = 0.07     # use_atr_stop=False 时启用：相对成本价固定止损
+    trail_stop: float = 0.12    # use_atr_stop=False 时启用：固定回撤止盈
+
     max_hold: int = 15          # 最长持有交易日
-    exit_below_ma: bool = True  # 收盘跌破 MA20 离场
+    # ⚠️ 入场条件是 close > MA(ma_support)，若出场也用同一条均线，
+    #    仓位建立瞬间就贴着自己的止损，止损距离≈0，会系统性砍掉赢家。
+    #    故出场均线单列且必须显著慢于 ma_support。
+    exit_below_ma: bool = False  # 默认关闭
+    ma_exit: int = 60            # 开启时使用的出场均线，需 > ma_support
 
     # ---- 交易成本 ----
     commission: float = 0.00025  # 双边佣金
@@ -245,12 +257,14 @@ def _days_since(cond: pd.DataFrame, ref: pd.DataFrame) -> pd.DataFrame:
 
 def backtest(px: dict, signal: pd.DataFrame, score: pd.DataFrame, cfg: Config):
     close, open_ = px['close'], px['open']
-    ma_s = close.rolling(cfg.ma_support).mean()
+    ma_x = close.rolling(cfg.ma_exit).mean()          # 出场均线，独立于入场门槛
+    atr = _atr(px['high'], px['low'], close, cfg.atr_n)
 
     dates, codes = close.index, close.columns
     C, O = close.values, open_.values
     CB, CS = px['can_buy'].values, px['can_sell'].values
-    MS, SIG, SC = ma_s.values, signal.values, score.values
+    MX, SIG, SC = ma_x.values, signal.values, score.values
+    ATR = atr.values
 
     cash = cfg.init_cash
     book = {}                      # col_idx -> dict
@@ -270,6 +284,8 @@ def backtest(px: dict, signal: pd.DataFrame, score: pd.DataFrame, cfg: Config):
             trades.append(dict(code=codes[j], entry=b['entry'], exit=p,
                                open_date=b['date'], close_date=dates[t],
                                days=b['days'], ret=p / b['entry'] - 1,
+                               stop_pct=(cfg.k_stop * b.get('atr0', np.nan) / b['entry']
+                                         if cfg.use_atr_stop else cfg.stop_loss),
                                reason=b['reason']))
         pend_sell = [j for j in pend_sell if j in book]
 
@@ -289,8 +305,11 @@ def backtest(px: dict, signal: pd.DataFrame, score: pd.DataFrame, cfg: Config):
             cost = p * shares * (1 + cfg.commission)
             if cost > cash:
                 continue
+            a0 = ATR[t - 1, j] if t > 0 else np.nan
+            if cfg.use_atr_stop and (np.isnan(a0) or a0 <= 0):
+                continue                                   # ATR 不可用则不建仓，避免无止损裸奔
             cash -= cost
-            book[j] = dict(shares=shares, entry=p, peak=C[t, j],
+            book[j] = dict(shares=shares, entry=p, peak=C[t, j], atr0=a0,
                            date=dates[t], days=0, reason='')
         pend_buy = []
 
@@ -313,12 +332,19 @@ def backtest(px: dict, signal: pd.DataFrame, score: pd.DataFrame, cfg: Config):
             c = C[t, j]
             if np.isnan(c):
                 continue
+            if cfg.use_atr_stop:
+                stop_lv = b['entry'] - cfg.k_stop * b['atr0']
+                trail_lv = b['peak'] - cfg.k_trail * b['atr0']
+            else:
+                stop_lv = b['entry'] * (1 - cfg.stop_loss)
+                trail_lv = b['peak'] * (1 - cfg.trail_stop)
+
             r = None
-            if c <= b['entry'] * (1 - cfg.stop_loss):
+            if c <= stop_lv:
                 r = 'stop_loss'
-            elif c <= b['peak'] * (1 - cfg.trail_stop):
+            elif c <= trail_lv:
                 r = 'trail_stop'
-            elif cfg.exit_below_ma and not np.isnan(MS[t, j]) and c < MS[t, j]:
+            elif cfg.exit_below_ma and not np.isnan(MX[t, j]) and c < MX[t, j]:
                 r = 'break_ma'
             elif b['days'] >= cfg.max_hold:
                 r = 'timeout'
